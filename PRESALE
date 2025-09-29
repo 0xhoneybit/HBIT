@@ -7,6 +7,11 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
+// ERC20 소수점 정보를 읽기 위한 인터페이스
+interface IERC20Metadata is IERC20 {
+    function decimals() external view returns (uint8);
+}
+
 // Band Protocol 오라클 인터페이스
 interface IBandPriceOracle {
     function getReferenceData(
@@ -19,345 +24,349 @@ interface IBandPriceOracle {
     );
 }
 
-// TWAP 오라클 인터페이스
-interface ITWAPOracle {
-    function consult(address token, uint256 period) external view returns (uint256 price);
-}
+/**
+ * @title HBIT PRESALE
+ * @dev HBIT 토큰의 사전 판매(프리세일)를 위한 컨트랙트입니다.
+ * @notice BNB와 USDT로 HBIT를 구매할 수 있으며, 다중 오라클로 가격 안정성을 확보합니다.
+ */
+contract HBIT_PRESALE is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20Metadata; // IERC20Metadata에 SafeERC20 적용
 
-contract HBITPresale is Ownable, ReentrancyGuard {
-    using SafeERC20 for IERC20;
-
-    // 총 판매 가능 HBIT량 (105,000,000 HBIT * 1e18)
-    uint256 public constant TOTAL_HBIT_FOR_SALE = 105_000_000 * 1e18;
+    // --- 판매 토큰 설정 ---
+    uint256 public constant TOTAL_HBIT_FOR_SALE = 96_000_000 * 1e18;
     uint256 public hbitDeposited;
 
-    // 구매 금액 제한 ($50 ~ $10,000)
-    uint256 public constant MIN_PURCHASE_USD = 50e18;
-    uint256 public constant MAX_PURCHASE_USD = 10000e18;
-    uint256 public constant MAX_PURCHASE_PER_USER = 10000e18;
+    // --- 구매 금액 제한 ---
+    uint256 public constant MIN_PURCHASE_USD = 100e18;
+    uint256 public constant MAX_PURCHASE_USD = 5000e18;
+    uint256 public constant MAX_PURCHASE_PER_USER = 5000e18;
 
     // 사용자별 누적 구매금액 추적
     mapping(address => uint256) public userTotalContributions;
 
-    // 상태 관리
+    // --- 상태 관리 ---
     enum State { Inactive, Active, Succeeded, Failed }
     State public currentState;
 
-    // 시간 설정
-    uint256 public constant SALE_START_TIME = 1759296000;
-    uint256 public constant SALE_END_TIME = 1770326400;
+    // --- 시간 설정 (KST 기준) ---
+    uint256 public constant SALE_START_TIME = 1727708400; // 2025-10-01 00:00 KST
+    uint256 public saleEndTime;
+    bool public saleExtended;
 
-    // ✅ 수정: 주소 타입은 immutable 유지 (가스 효율성)
-    IERC20 public immutable HBIT_TOKEN;
-    IERC20 public immutable USDT_TOKEN;
+    // --- 외부 컨트랙트 주소 ---
+    IERC20Metadata public immutable HBIT_TOKEN;
+    IERC20Metadata public immutable USDT_TOKEN;
     AggregatorV3Interface public immutable chainlinkOracle;
     AggregatorV3Interface public immutable usdtUsdOracle;
-    ITWAPOracle public immutable twapOracle;
     IBandPriceOracle public immutable bandOracle;
 
-    // ✅ 수정: string → bytes32로 변경하여 immutable 사용 가능
-    bytes32 public immutable BAND_BASE_SYMBOL;
-    bytes32 public immutable BAND_QUOTE_SYMBOL;
+    // immutable 키워드 제거
+    string public BAND_BASE_SYMBOL;
+    string public BAND_QUOTE_SYMBOL;
+    
+    // --- 동적 소수점 저장 변수 ---
+    uint8 private immutable usdtDecimals;
+    uint8 private immutable chainlinkDecimals;
+    uint8 private immutable usdtUsdOracleDecimals;
 
-    // 판매 설정
-    uint256 public constant HBIT_PRICE_USD = 0.02e18;
-    uint256 public constant HARD_CAP_USD = 2100000e18;
-    uint256 public constant SOFT_CAP_USD = 840000e18;
-    uint256 public constant MAX_PRICE_DEVIATION = 5e16;
-    uint256 public constant TWAP_PERIOD = 3600;
+    // --- 판매 정책 설정 ---
+    uint256 public constant HBIT_PRICE_USD = 25e15; // $0.025
+    uint256 public constant HARD_CAP_USD = 2400000e18;
+    uint256 public constant SOFT_CAP_USD = 1080000e18;
+    uint256 public constant MAX_PRICE_DEVIATION = 39e15; // 3.9%
     uint256 public constant ORACLE_STALE_THRESHOLD = 1 hours;
 
-    // 데이터 저장소
+    // --- 데이터 저장소 ---
     uint256 public totalUsdRaised;
-    uint256 public totalBnbRaised;
     mapping(address => uint256) public contributionsBnb;
     mapping(address => uint256) public contributionsUsdt;
     mapping(address => uint256) public lockedUsdValue;
 
-    // 이벤트
+    // --- 이벤트 ---
     event PurchaseBNB(address indexed buyer, uint256 bnbAmount, uint256 usdValue, uint256 hbitAmount);
     event PurchaseUSDT(address indexed buyer, uint256 usdtAmount, uint256 usdValue, uint256 hbitAmount);
     event ClaimTokens(address indexed user, uint256 hbitAmount);
-    event ClaimRefund(address indexed user, uint256 amount);
+    event ClaimRefund(address indexed user, uint256 bnbAmount, uint256 usdtAmount);
     event Withdraw(address indexed recipient, uint256 bnbAmount, uint256 usdtAmount);
-    event OracleDeviationExceeded(uint256 chainlinkPrice, uint256 twapPrice, uint256 bandPrice);
     event PresaleEnded(bool isSuccess);
     event HBITDeposited(address indexed depositor, uint256 amount);
+    event HbitEmergencyWithdrawn(address indexed owner, uint256 amount);
+    event SaleExtended(uint256 indexed newEndTime);
 
-    // ✅ 수정: bytes32 파라미터 추가
+    /**
+     * @dev 컨트랙트 생성자
+     * @notice 프리세일에 필요한 모든 외부 컨트랙트 주소와 동적 소수점 정보를 설정합니다.
+     */
     constructor(
         address _hbitToken,
         address _usdtToken,
         address _chainlinkOracle,
         address _usdtUsdOracle,
-        address _twapOracle,
         address _bandOracle,
-        string memory _bandBaseSymbol,  // string으로 입력받지만
-        string memory _bandQuoteSymbol  // 내부적으로 bytes32로 변환
-    ) Ownable(msg.sender) {
-        require(_hbitToken != address(0), "Invalid HBIT token");
-        require(_usdtToken != address(0), "Invalid USDT token");
-        require(_chainlinkOracle != address(0), "Invalid Chainlink oracle");
-        require(_usdtUsdOracle != address(0), "Invalid USDT/USD oracle");
-        require(_twapOracle != address(0), "Invalid TWAP oracle");
-        require(_bandOracle != address(0), "Invalid Band oracle");
+        string memory _bandBaseSymbol,
+        string memory _bandQuoteSymbol,
+        address _initialOwner
+    ) Ownable(_initialOwner) { // OZ v5 표준에 따라 인자 전달
+        require(_hbitToken != address(0) && _usdtToken != address(0), "Invalid token address");
+        require(_chainlinkOracle != address(0) && _usdtUsdOracle != address(0), "Invalid oracle address");
+        require(_bandOracle != address(0), "Invalid Band oracle address");
+        require(_initialOwner != address(0), "Invalid initial owner");
 
-        // ✅ immutable 주소 타입 초기화
-        HBIT_TOKEN = IERC20(_hbitToken);
-        USDT_TOKEN = IERC20(_usdtToken);
+        HBIT_TOKEN = IERC20Metadata(_hbitToken);
+        USDT_TOKEN = IERC20Metadata(_usdtToken);
         chainlinkOracle = AggregatorV3Interface(_chainlinkOracle);
         usdtUsdOracle = AggregatorV3Interface(_usdtUsdOracle);
-        twapOracle = ITWAPOracle(_twapOracle);
         bandOracle = IBandPriceOracle(_bandOracle);
 
-        // ✅ string → bytes32 변환하여 immutable 저장
-        BAND_BASE_SYMBOL = bytes32(bytes(_bandBaseSymbol));
-        BAND_QUOTE_SYMBOL = bytes32(bytes(_bandQuoteSymbol));
+        BAND_BASE_SYMBOL = _bandBaseSymbol;
+        BAND_QUOTE_SYMBOL = _bandQuoteSymbol;
+
+        // 동적으로 소수점 정보 조회 및 저장
+        usdtDecimals = USDT_TOKEN.decimals();
+        chainlinkDecimals = chainlinkOracle.decimals();
+        usdtUsdOracleDecimals = usdtUsdOracle.decimals();
 
         currentState = State.Inactive;
+        saleEndTime = 1738335600; // 초기 판매 종료 시간: 2026-02-01 00:00 KST
     }
 
-    // 관리자 기능
+    // --- 관리자 기능 ---
+
     function startPresale() external onlyOwner {
-        require(block.timestamp >= SALE_START_TIME, "Presale not started yet");
-        require(block.timestamp <= SALE_END_TIME, "Presale already ended");
+        require(block.timestamp >= SALE_START_TIME, "Presale has not started yet");
+        require(currentState == State.Inactive, "Presale already started or ended");
         currentState = State.Active;
     }
 
     function endPresale() external onlyOwner {
-        require(currentState == State.Active, "Presale not active");
-        require(block.timestamp >= SALE_END_TIME, "Presale period not ended");
+        require(currentState == State.Active, "Presale is not active");
+        require(block.timestamp >= saleEndTime, "Presale period has not ended yet");
 
         bool isSuccess = totalUsdRaised >= SOFT_CAP_USD;
-        currentState = isSuccess ? State.Succeeded : State.Failed;
+        
+        if (isSuccess) {
+            // 판매 성공 시, 약속된 HBIT가 예치되었는지 최종 검증
+            uint256 requiredHbit = (totalUsdRaised * 1e18) / HBIT_PRICE_USD;
+            require(hbitDeposited >= requiredHbit, "Insufficient HBIT deposited for claims");
+            currentState = State.Succeeded;
+        } else {
+            currentState = State.Failed;
+        }
+
         emit PresaleEnded(isSuccess);
     }
 
-    // BNB 구매 (구매 제한 적용)
-    receive() external payable {
+    function extendSale(uint256 _newEndTime) external onlyOwner {
+        require(!saleExtended, "Sale has already been extended once");
+        require(currentState == State.Active, "Sale must be active to extend");
+        require(_newEndTime > saleEndTime, "New end time must be after the current one");
+
+        saleEndTime = _newEndTime;
+        saleExtended = true;
+        emit SaleExtended(_newEndTime);
+    }
+    
+    function depositHbitForSale(uint256 amountWithoutDecimals) external onlyOwner {
+        require(amountWithoutDecimals > 0, "Amount must be > 0");
+        uint256 amountWithDecimals = amountWithoutDecimals * 1e18;
+        require(hbitDeposited + amountWithDecimals <= TOTAL_HBIT_FOR_SALE, "Would exceed max HBIT supply for sale");
+        HBIT_TOKEN.safeTransferFrom(msg.sender, address(this), amountWithDecimals);
+        hbitDeposited += amountWithDecimals;
+        emit HBITDeposited(msg.sender, amountWithDecimals);
+    }
+
+    function emergencyWithdrawHbit() external onlyOwner nonReentrant {
+        require(totalUsdRaised == 0, "Cannot withdraw after contributions have been made");
+        require(currentState != State.Succeeded, "Cannot withdraw HBIT after a successful sale");
+        
+        uint256 balance = HBIT_TOKEN.balanceOf(address(this));
+        require(balance > 0, "No HBIT to withdraw");
+
+        hbitDeposited = 0;
+        HBIT_TOKEN.safeTransfer(owner(), balance);
+        emit HbitEmergencyWithdrawn(owner(), balance);
+    }
+
+    function withdrawFunds(address payable _recipient) external onlyOwner nonReentrant {
+        require(currentState == State.Succeeded, "Presale not succeeded");
+        require(_recipient != address(0), "Zero address");
+
+        uint256 bnbBalance = address(this).balance;
+        if (bnbBalance > 0) {
+            // 안전한 BNB 전송 방식으로 수정
+            (bool success, ) = _recipient.call{value: bnbBalance}("");
+            require(success, "BNB transfer failed");
+        }
+
+        uint256 usdtBalance = USDT_TOKEN.balanceOf(address(this));
+        if (usdtBalance > 0) {
+            USDT_TOKEN.safeTransfer(_recipient, usdtBalance);
+        }
+        
+        emit Withdraw(_recipient, bnbBalance, usdtBalance);
+    }
+
+    // --- 사용자 구매 기능 ---
+
+    receive() external payable nonReentrant { // 재진입 방지 추가
+        _purchaseWithBNB();
+    }
+
+    function purchaseWithBNB() external payable nonReentrant {
+        _purchaseWithBNB();
+    }
+    
+    function _purchaseWithBNB() private {
         require(msg.value > 0, "Zero BNB amount");
-        require(currentState == State.Active, "Presale not active");
-        require(block.timestamp >= SALE_START_TIME && block.timestamp <= SALE_END_TIME, "Presale period ended");
+        require(currentState == State.Active, "Presale is not active");
+        require(block.timestamp >= SALE_START_TIME && block.timestamp <= saleEndTime, "Not within presale period");
 
         uint256 usdValue = _getVerifiedUsdValueFromBnb(msg.value);
         require(usdValue > 0, "Invalid USD value");
 
-        // 구매 금액 제한 검증
-        require(usdValue >= MIN_PURCHASE_USD, "Below minimum purchase");
-        require(usdValue <= MAX_PURCHASE_USD, "Above maximum purchase per transaction");
-        require(userTotalContributions[msg.sender] + usdValue <= MAX_PURCHASE_PER_USER, "Exceeded user purchase limit");
-
-        uint256 hbitAmount = (usdValue * 1e18) / HBIT_PRICE_USD;
-        require(totalUsdRaised + usdValue <= HARD_CAP_USD, "Hard cap exceeded");
-        require(hbitDeposited + hbitAmount <= TOTAL_HBIT_FOR_SALE, "Insufficient HBIT supply");
+        _processPurchase(msg.sender, usdValue);
 
         contributionsBnb[msg.sender] += msg.value;
-        lockedUsdValue[msg.sender] += usdValue;
-        userTotalContributions[msg.sender] += usdValue;
-        totalUsdRaised += usdValue;
-        totalBnbRaised += msg.value;
-
+        
+        uint256 hbitAmount = (usdValue * 1e18) / HBIT_PRICE_USD;
         emit PurchaseBNB(msg.sender, msg.value, usdValue, hbitAmount);
     }
 
-    // purchaseWithBNB (구매 제한 적용)
-    function purchaseWithBNB(uint256 minHbitAmount) external payable nonReentrant {
-        require(msg.value > 0, "Zero BNB amount");
-        require(currentState == State.Active, "Presale not active");
-        require(block.timestamp >= SALE_START_TIME && block.timestamp <= SALE_END_TIME, "Presale period ended");
-
-        uint256 usdValue = _getVerifiedUsdValueFromBnb(msg.value);
-        require(usdValue > 0, "Invalid USD value");
-
-        // 구매 금액 제한 검증
-        require(usdValue >= MIN_PURCHASE_USD, "Below minimum purchase");
-        require(usdValue <= MAX_PURCHASE_USD, "Above maximum purchase per transaction");
-        require(userTotalContributions[msg.sender] + usdValue <= MAX_PURCHASE_PER_USER, "Exceeded user purchase limit");
-
-        uint256 hbitAmount = (usdValue * 1e18) / HBIT_PRICE_USD;
-        require(hbitAmount >= minHbitAmount, "Insufficient HBIT amount");
-        require(totalUsdRaised + usdValue <= HARD_CAP_USD, "Hard cap exceeded");
-        require(hbitDeposited + hbitAmount <= TOTAL_HBIT_FOR_SALE, "Insufficient HBIT supply");
-
-        contributionsBnb[msg.sender] += msg.value;
-        lockedUsdValue[msg.sender] += usdValue;
-        userTotalContributions[msg.sender] += usdValue;
-        totalUsdRaised += usdValue;
-        totalBnbRaised += msg.value;
-
-        emit PurchaseBNB(msg.sender, msg.value, usdValue, hbitAmount);
-    }
-
-    // purchaseWithUSDT (구매 제한 적용)
-    function purchaseWithUSDT(
-        uint256 amount,
-        uint256 minHbitAmount,
-        uint256 maxUsdAmount
-    ) external nonReentrant {
+    function purchaseWithUSDT(uint256 amount) external nonReentrant {
         require(amount > 0, "Zero USDT amount");
-        require(currentState == State.Active, "Presale not active");
-        require(block.timestamp >= SALE_START_TIME && block.timestamp <= SALE_END_TIME, "Presale period ended");
-        require(maxUsdAmount > 0, "Invalid max USD");
-
-        uint256 usdValue = _getVerifiedUsdValueFromUSDT(amount);
-        require(usdValue <= maxUsdAmount, "USD slippage exceeded");
-
-        // 구매 금액 제한 검증
-        require(usdValue >= MIN_PURCHASE_USD, "Below minimum purchase");
-        require(usdValue <= MAX_PURCHASE_USD, "Above maximum purchase per transaction");
-        require(userTotalContributions[msg.sender] + usdValue <= MAX_PURCHASE_PER_USER, "Exceeded user purchase limit");
+        require(currentState == State.Active, "Presale is not active");
+        require(block.timestamp >= SALE_START_TIME && block.timestamp <= saleEndTime, "Not within presale period");
 
         USDT_TOKEN.safeTransferFrom(msg.sender, address(this), amount);
 
-        uint256 hbitAmount = (usdValue * 1e18) / HBIT_PRICE_USD;
-        require(hbitAmount >= minHbitAmount, "Insufficient HBIT amount");
-        require(totalUsdRaised + usdValue <= HARD_CAP_USD, "Hard cap exceeded");
-        require(hbitDeposited + hbitAmount <= TOTAL_HBIT_FOR_SALE, "Insufficient HBIT supply");
+        uint256 usdValue = _getVerifiedUsdValueFromUSDT(amount);
+        _processPurchase(msg.sender, usdValue);
 
         contributionsUsdt[msg.sender] += amount;
-        lockedUsdValue[msg.sender] += usdValue;
-        userTotalContributions[msg.sender] += usdValue;
-        totalUsdRaised += usdValue;
-
+        
+        uint256 hbitAmount = (usdValue * 1e18) / HBIT_PRICE_USD;
         emit PurchaseUSDT(msg.sender, amount, usdValue, hbitAmount);
     }
+    
+    function _processPurchase(address _buyer, uint256 _usdValue) private {
+        require(_usdValue >= MIN_PURCHASE_USD, "Contribution is below minimum");
+        require(_usdValue <= MAX_PURCHASE_USD, "Contribution is above maximum per transaction");
+        require(userTotalContributions[_buyer] + _usdValue <= MAX_PURCHASE_PER_USER, "Exceeded user's total purchase limit");
+        require(totalUsdRaised + _usdValue <= HARD_CAP_USD, "Hard cap would be exceeded");
 
-    /**
-     * USDT를 USD로 안전하게 변환 (USDT/USD 오라클 사용)
-     */
+        uint256 hbitAmount = (_usdValue * 1e18) / HBIT_PRICE_USD;
+        uint256 totalHbitSold = (totalUsdRaised * 1e18) / HBIT_PRICE_USD;
+        require(totalHbitSold + hbitAmount <= TOTAL_HBIT_FOR_SALE, "Insufficient HBIT for sale");
+
+        lockedUsdValue[_buyer] += _usdValue;
+        userTotalContributions[_buyer] += _usdValue;
+        totalUsdRaised += _usdValue;
+    }
+
+    // --- 사용자 클레임 및 환불 기능 ---
+
+    function claimTokens() external nonReentrant {
+        require(currentState == State.Succeeded, "Presale has not succeeded");
+        uint256 userUsdValue = lockedUsdValue[msg.sender];
+        require(userUsdValue > 0, "No contribution to claim");
+
+        uint256 hbitAmount = (userUsdValue * 1e18) / HBIT_PRICE_USD;
+        lockedUsdValue[msg.sender] = 0;
+
+        require(HBIT_TOKEN.balanceOf(address(this)) >= hbitAmount, "Insufficient HBIT balance for claims");
+        HBIT_TOKEN.safeTransfer(msg.sender, hbitAmount);
+
+        emit ClaimTokens(msg.sender, hbitAmount);
+    }
+    
+    function claimRefund() external nonReentrant {
+        require(currentState == State.Failed, "Presale did not fail");
+        uint256 bnbAmount = contributionsBnb[msg.sender];
+        uint256 usdtAmount = contributionsUsdt[msg.sender];
+        require(bnbAmount > 0 || usdtAmount > 0, "No contribution to refund");
+
+        // 모든 사용자 데이터 초기화
+        contributionsBnb[msg.sender] = 0;
+        contributionsUsdt[msg.sender] = 0;
+        userTotalContributions[msg.sender] = 0;
+        lockedUsdValue[msg.sender] = 0;
+
+        if (bnbAmount > 0) {
+            (bool success, ) = msg.sender.call{value: bnbAmount}("");
+            require(success, "BNB refund failed");
+        }
+        if (usdtAmount > 0) {
+            USDT_TOKEN.safeTransfer(msg.sender, usdtAmount);
+        }
+
+        emit ClaimRefund(msg.sender, bnbAmount, usdtAmount);
+    }
+
+    // --- 오라클 및 가격 계산 함수 ---
+
     function _getVerifiedUsdValueFromUSDT(uint256 usdtAmount) internal view returns (uint256) {
         (, int256 usdtUsdPrice, , uint256 usdtUsdUpdatedAt, ) = usdtUsdOracle.latestRoundData();
-        require(usdtUsdUpdatedAt > 0, "USDT/USD oracle stale");
-        require(block.timestamp - usdtUsdUpdatedAt < ORACLE_STALE_THRESHOLD, "USDT/USD oracle too old");
+        require(usdtUsdUpdatedAt > 0 && block.timestamp - usdtUsdUpdatedAt < ORACLE_STALE_THRESHOLD, "USDT/USD oracle is stale or invalid");
         require(usdtUsdPrice > 0, "Invalid USDT/USD price");
-        return (usdtAmount * uint256(usdtUsdPrice)) / 1e8;
+        
+        // 동적으로 조회된 소수점 정보를 사용하여 USD 가치 계산
+        return (usdtAmount * uint256(usdtUsdPrice) * (10**(18 - usdtDecimals))) / (10**usdtUsdOracleDecimals);
     }
 
-    /**
-     * ✅ 수정: Band Protocol 호출 시 bytes32 → string 변환
-     */
     function _getVerifiedUsdValueFromBnb(uint256 bnbAmount) internal view returns (uint256) {
-        // Chainlink 가격
-        (, int256 chainlinkPrice, , uint256 chainlinkUpdatedAt, ) = chainlinkOracle.latestRoundData();
-        require(chainlinkUpdatedAt > 0, "Chainlink data stale");
-        require(block.timestamp - chainlinkUpdatedAt < ORACLE_STALE_THRESHOLD, "Chainlink data too old");
-        require(chainlinkPrice > 0, "Invalid Chainlink price");
-        uint256 chainlinkUsdValue = (uint256(chainlinkPrice) * bnbAmount) / 1e8;
+        (, int256 chainlinkPriceInt, , uint256 chainlinkUpdatedAt, ) = chainlinkOracle.latestRoundData();
+        require(chainlinkUpdatedAt > 0 && block.timestamp - chainlinkUpdatedAt < ORACLE_STALE_THRESHOLD, "Chainlink oracle is stale or invalid");
+        require(chainlinkPriceInt > 0, "Invalid Chainlink price");
+        uint256 chainlinkPrice = uint256(chainlinkPriceInt);
 
-        // ✅ bytes32 → string 변환하여 Band Protocol 호출
-        (uint256 bandPrice, uint256 bandLastUpdated, ) = bandOracle.getReferenceData(
-            string(abi.encodePacked(BAND_BASE_SYMBOL)),  // bytes32 → string 변환
-            string(abi.encodePacked(BAND_QUOTE_SYMBOL))  // bytes32 → string 변환
+        (uint256 bandRate, uint256 bandLastUpdated, ) = bandOracle.getReferenceData(
+            BAND_BASE_SYMBOL,
+            BAND_QUOTE_SYMBOL
         );
-        require(bandPrice > 0, "Invalid Band price");
-        require(block.timestamp - bandLastUpdated < ORACLE_STALE_THRESHOLD, "Band data too old");
-        uint256 bandUsdValue = (bandPrice * bnbAmount) / 1e18;
+        require(bandLastUpdated > 0 && block.timestamp - bandLastUpdated < ORACLE_STALE_THRESHOLD, "Band oracle is stale or invalid");
+        require(bandRate > 0, "Invalid Band price");
 
-        // 가격 편차 검증
+        // 동적으로 조회된 소수점 정보를 사용하여 가격 계산
+        uint256 chainlinkUsdValueFull = (bnbAmount * chainlinkPrice) / (10**chainlinkDecimals);
+        uint256 bandUsdValueFull = (bnbAmount * bandRate) / 1e18;
+
         require(
-            _arePricesWithinDeviation(chainlinkUsdValue, bandUsdValue, MAX_PRICE_DEVIATION),
-            "Oracle deviation too high"
+            _arePricesWithinDeviation(chainlinkUsdValueFull, bandUsdValueFull, MAX_PRICE_DEVIATION),
+            "Oracle price deviation is too high"
         );
-
-        return (chainlinkUsdValue * 60 + bandUsdValue * 40) / 100;
+        
+        return (chainlinkUsdValueFull * 60 + bandUsdValueFull * 40) / 100;
     }
-
-    /**
-     * 두 가격 간 편차가 허용 범위 이내인지 확인
-     */
+    
     function _arePricesWithinDeviation(
         uint256 price1,
         uint256 price2,
         uint256 maxDeviation
     ) internal pure returns (bool) {
         if (price1 == 0 || price2 == 0) return false;
-        uint256 lowerBound = (price1 * (1e18 - maxDeviation)) / 1e18;
-        uint256 upperBound = (price1 * (1e18 + maxDeviation)) / 1e18;
-        return price2 >= lowerBound && price2 <= upperBound;
+        
+        uint256 maxPrice = price1 > price2 ? price1 : price2;
+        uint256 diff = price1 > price2 ? price1 - price2 : price2 - price1;
+        
+        return (diff * 1e18) / maxPrice <= maxDeviation;
     }
-
-    // claimRefund에서 사용자 누적금액 초기화
-    function claimRefund() external nonReentrant {
-        require(currentState == State.Failed, "Presale not failed");
-        uint256 bnbAmount = contributionsBnb[msg.sender];
-        uint256 usdtAmount = contributionsUsdt[msg.sender];
-
-        if (bnbAmount > 0) payable(msg.sender).transfer(bnbAmount);
-        if (usdtAmount > 0) USDT_TOKEN.safeTransfer(msg.sender, usdtAmount);
-
-        // 사용자 데이터 초기화
-        userTotalContributions[msg.sender] = 0;
-        contributionsBnb[msg.sender] = 0;
-        contributionsUsdt[msg.sender] = 0;
-        lockedUsdValue[msg.sender] = 0;
-
-        emit ClaimRefund(msg.sender, bnbAmount + usdtAmount);
-    }
-
-    // 나머지 함수 (이전과 동일)
-    function claimTokens() external nonReentrant {
-        require(currentState == State.Succeeded, "Presale not succeeded");
-        uint256 userUsdValue = lockedUsdValue[msg.sender];
-        require(userUsdValue > 0, "No contribution");
-
-        uint256 hbitAmount = (userUsdValue * 1e18) / HBIT_PRICE_USD;
-        require(HBIT_TOKEN.balanceOf(address(this)) >= hbitAmount, "Insufficient HBIT balance");
-        HBIT_TOKEN.safeTransfer(msg.sender, hbitAmount);
-        emit ClaimTokens(msg.sender, hbitAmount);
-    }
-
-    function withdrawFunds(
-        address payable _recipient,
-        uint256 _maxBnb,
-        uint256 _maxUsdt
-    ) external onlyOwner nonReentrant {
-        require(currentState == State.Succeeded, "Presale not succeeded");
-        require(_recipient != address(0), "Zero address");
-
-        uint256 bnbAmount = _maxBnb > 0
-            ? (_maxBnb < address(this).balance ? _maxBnb : address(this).balance)
-            : address(this).balance;
-        uint256 usdtAmount = _maxUsdt > 0
-            ? (_maxUsdt < USDT_TOKEN.balanceOf(address(this)) ? _maxUsdt : USDT_TOKEN.balanceOf(address(this)))
-            : USDT_TOKEN.balanceOf(address(this));
-
-        if (bnbAmount > 0) payable(_recipient).transfer(bnbAmount);
-        if (usdtAmount > 0) USDT_TOKEN.safeTransfer(_recipient, usdtAmount);
-
-        emit Withdraw(_recipient, bnbAmount, usdtAmount);
-    }
-
-    function depositHbitForSale(uint256 amount) external onlyOwner {
-        require(amount > 0, "Amount must be > 0");
-        require(hbitDeposited + amount * 1e18 <= TOTAL_HBIT_FOR_SALE, "Would exceed max HBIT supply");
-        HBIT_TOKEN.safeTransferFrom(msg.sender, address(this), amount * 1e18);
-        hbitDeposited += amount * 1e18;
-        emit HBITDeposited(msg.sender, amount * 1e18);
-    }
+    
+    // --- View 함수 ---
 
     function getPresaleStatus() external view returns (
         State state,
         uint256 totalRaised,
         uint256 hardCap,
-        uint256 softCap,
-        bool isSoftCapReached,
-        bool isHardCapReached,
-        bool isSalePeriodActive,
-        uint256 hbitAvailable
+        uint256 softCap
     ) {
         return (
             currentState,
             totalUsdRaised,
             HARD_CAP_USD,
-            SOFT_CAP_USD,
-            totalUsdRaised >= SOFT_CAP_USD,
-            totalUsdRaised >= HARD_CAP_USD,
-            block.timestamp >= SALE_START_TIME && block.timestamp <= SALE_END_TIME,
-            TOTAL_HBIT_FOR_SALE - hbitDeposited
+            SOFT_CAP_USD
         );
     }
-
-    // 사용자별 구매 정보 조회 함수
+    
     function getUserPurchaseInfo(address user) external view returns (
         uint256 totalContributed,
         uint256 remainingAllowance
@@ -367,13 +376,24 @@ contract HBITPresale is Ownable, ReentrancyGuard {
             MAX_PURCHASE_PER_USER - userTotalContributions[user]
         );
     }
-
-    // ✅ 추가: Band 심볼 조회 함수 (bytes32 → string 변환)
-    function getBandBaseSymbol() external view returns (string memory) {
-        return string(abi.encodePacked(BAND_BASE_SYMBOL));
-    }
-
-    function getBandQuoteSymbol() external view returns (string memory) {
-        return string(abi.encodePacked(BAND_QUOTE_SYMBOL));
+    
+    /**
+     * @dev 사용자의 모든 구매 관련 정보를 상세 조회합니다.
+     * @notice 회계 및 데이터 추적의 편의를 위해 추가된 함수입니다.
+     * @param user 조회할 사용자의 주소
+     * @return bnbContributed 사용자가 기여한 총 BNB 수량
+     * @return usdtContributed 사용자가 기여한 총 USDT 수량
+     * @return totalUsdValue 사용자의 기여를 USD로 환산한 총 가치
+     */
+    function getUserContributionDetails(address user) external view returns (
+        uint256 bnbContributed,
+        uint256 usdtContributed,
+        uint256 totalUsdValue
+    ) {
+        return (
+            contributionsBnb[user],
+            contributionsUsdt[user],
+            lockedUsdValue[user]
+        );
     }
 }
