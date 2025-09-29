@@ -8,11 +8,11 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
- * @title HBIT_Staking_Production
- * @dev The production-ready, audited staking contract for the HBIT token.
- * All theoretical risks and edge cases have been addressed.
+ * @title HBIT STAKING
+ * @dev HBIT 토큰 스테이킹 컨트랙트.
+ * @notice 다양한 조건의 스테이킹 상품(볼트)을 제공합니다.
  */
-contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
+contract HBIT_STAKING is ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     // --- State Variables ---
@@ -39,10 +39,9 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
 
     // --- Policy Constants ---
     uint256 public constant EARLY_WITHDRAWAL_PENALTY_PERIOD = 48 hours;
-    uint256 public constant BASIC_VAULT_WITHDRAWAL_DELAY = 8 hours;
+    uint256 public constant BASIC_VAULT_WITHDRAWAL_DELAY = 24 hours;
     uint256 public constant PRECISION_DIVISOR = 10000;
     uint256 public constant MAX_APY = 5000; // 50.00% APY limit
-    // --- ADDED: Safety guard for lockup period ---
     uint256 public constant MAX_LOCKUP_PERIOD_DAYS = 1825; // 5 years
 
     // --- Events ---
@@ -51,10 +50,15 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
     event EarlyWithdrawalRequested(address indexed user, uint256 indexed vaultId);
     event EarlyWithdrawn(address indexed user, uint256 indexed vaultId, uint256 amount, uint256 rewards);
     event EmergencyWithdrawn(address indexed user, uint256 indexed vaultId, uint256 amount);
-    event RewardsSynced(address indexed owner, uint256 newRewardPoolAmount);
+    event RewardDeposited(address indexed depositor, uint256 amount);
     event VaultCreated(uint256 indexed vaultId, uint256 apy, uint256 lockupPeriod);
     event VaultStatusUpdated(uint256 indexed vaultId, bool isActive);
 
+    /**
+     * @dev 컨트랙트 생성자
+     * @notice HBIT 토큰 주소를 설정하고 기본 볼트를 생성합니다.
+     * @param _hbitTokenAddress HBIT 토큰 컨트랙트 주소
+     */
     constructor(address _hbitTokenAddress) Ownable(msg.sender) {
         require(_hbitTokenAddress != address(0), "Token address cannot be zero");
         HBITToken = IERC20(_hbitTokenAddress);
@@ -63,7 +67,13 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
         emit VaultCreated(0, 450, 0);
     }
 
-    // --- Vault Management (Owner Only) ---
+    /**
+     * @dev 볼트 생성 기능 (관리자 전용)
+     * @notice 새로운 조건의 스테이킹 상품(볼트)을 추가합니다.
+     * @param _apy 연간 이자율 (APY, 100 = 1.00%)
+     * @param _lockupPeriodInDays 락업 기간 (일)
+     * @param _minDeposit 최소 예치 수량
+     */
     function createVault(uint256 _apy, uint256 _lockupPeriodInDays, uint256 _minDeposit) external onlyOwner {
         require(_apy <= MAX_APY, "APY exceeds maximum limit");
         require(_lockupPeriodInDays <= MAX_LOCKUP_PERIOD_DAYS, "Lockup period exceeds maximum limit");
@@ -73,21 +83,36 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
         emit VaultCreated(vaults.length - 1, _apy, _lockupPeriodInDays * 1 days);
     }
 
+    /**
+     * @dev 볼트 상태 변경 기능 (관리자 전용)
+     * @notice 볼트의 신규 스테이킹 가능 여부를 설정합니다.
+     * @param _vaultId 볼트 ID
+     * @param _isActive 활성화 상태
+     */
     function updateVaultStatus(uint256 _vaultId, bool _isActive) external onlyOwner {
         require(_vaultId < vaults.length, "Vault does not exist");
         vaults[_vaultId].active = _isActive;
         emit VaultStatusUpdated(_vaultId, _isActive);
     }
 
-    function syncRewardPool() external onlyOwner {
-        uint256 currentBalance = HBITToken.balanceOf(address(this));
-        uint256 stakedPrincipal = totalStaked;
-        require(currentBalance >= stakedPrincipal, "Contract balance is less than total staked principal");
-        rewardPool = currentBalance - stakedPrincipal;
-        emit RewardsSynced(owner(), rewardPool);
+    /**
+     * @dev 리워드 풀에 토큰 예치 기능 (관리자 전용)
+     * @notice 관리자가 리워드 풀에 HBIT 토큰을 직접 입금합니다.
+     * @param _amount 입금할 토큰 수량
+     */
+    function depositReward(uint256 _amount) external onlyOwner nonReentrant {
+        require(_amount > 0, "Amount must be greater than zero");
+        HBITToken.safeTransferFrom(msg.sender, address(this), _amount);
+        rewardPool += _amount;
+        emit RewardDeposited(msg.sender, _amount);
     }
 
-    // --- Staking Logic ---
+    /**
+     * @dev 스테이킹 기능
+     * @notice 특정 볼트에 토큰을 예치합니다. (볼트당 1회)
+     * @param _vaultId 스테이킹할 볼트 ID
+     * @param _amount 예치할 토큰 수량
+     */
     function stake(uint256 _vaultId, uint256 _amount) external nonReentrant {
         Vault storage vault = vaults[_vaultId];
         require(vault.active, "Vault is not active for new stakes");
@@ -100,9 +125,12 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
         emit Staked(msg.sender, _vaultId, _amount);
     }
 
-    // --- Withdrawal Logic ---
+    /**
+     * @dev 인출 기능
+     * @notice 락업 기간 종료 후, 원금과 이자를 인출합니다.
+     * @param _vaultId 인출할 볼트 ID
+     */
     function withdraw(uint256 _vaultId) external nonReentrant {
-        // 1. Checks
         Stake storage selectedStake = userStakes[msg.sender][_vaultId];
         require(selectedStake.amount > 0, "No active stake in this vault");
         require(!selectedStake.isWithdrawingEarly, "Use finalizeEarlyWithdrawal");
@@ -114,7 +142,6 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
             require(block.timestamp >= selectedStake.startTime + vault.lockupPeriod, "Lock-up period not ended");
         }
 
-        // 2. Effects
         uint256 principal = selectedStake.amount;
         uint256 rewards = _calculateRewards(selectedStake.startTime, principal, vaults[_vaultId].apy);
         require(rewardPool >= rewards, "Insufficient rewards in pool");
@@ -123,12 +150,15 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
         totalStaked -= principal;
         delete userStakes[msg.sender][_vaultId];
 
-        // 3. Interactions
         HBITToken.safeTransfer(msg.sender, principal + rewards);
         emit Withdrawn(msg.sender, _vaultId, principal, rewards);
     }
 
-    // --- Early Withdrawal Logic ---
+    /**
+     * @dev 중도 인출 요청 기능
+     * @notice 락업 기간 종료 전 인출을 요청합니다. (48시간 대기)
+     * @param _vaultId 요청할 볼트 ID
+     */
     function requestEarlyWithdrawal(uint256 _vaultId) external nonReentrant {
         require(_vaultId > 0, "Not for the Basic vault");
         Stake storage selectedStake = userStakes[msg.sender][_vaultId];
@@ -143,14 +173,17 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
         emit EarlyWithdrawalRequested(msg.sender, _vaultId);
     }
 
+    /**
+     * @dev 중도 인출 실행 기능
+     * @notice 요청 후 48시간이 지나면 패널티 적용 후 인출합니다.
+     * @param _vaultId 실행할 볼트 ID
+     */
     function finalizeEarlyWithdrawal(uint256 _vaultId) external nonReentrant {
-        // 1. Checks
         Stake storage selectedStake = userStakes[msg.sender][_vaultId];
         require(selectedStake.isWithdrawingEarly, "No early withdrawal request");
         require(block.timestamp >= selectedStake.earlyWithdrawalRequestTime + EARLY_WITHDRAWAL_PENALTY_PERIOD, "Penalty period not ended");
         require(vaults.length > 0, "Basic vault is not configured");
 
-        // 2. Effects
         uint256 principal = selectedStake.amount;
         uint256 penaltyApy = vaults[0].apy;
         uint256 rewards = _calculateRewards(selectedStake.startTime, principal, penaltyApy);
@@ -160,40 +193,55 @@ contract HBIT_Staking_Production is ReentrancyGuard, Ownable {
         totalStaked -= principal;
         delete userStakes[msg.sender][_vaultId];
 
-        // 3. Interactions
         HBITToken.safeTransfer(msg.sender, principal + rewards);
         emit EarlyWithdrawn(msg.sender, _vaultId, principal, rewards);
     }
 
-    // --- Emergency Function ---
+    /**
+     * @dev 긴급 인출 기능
+     * @notice 모든 이자를 포기하고 원금만 즉시 인출합니다.
+     * @param _vaultId 긴급 인출할 볼트 ID
+     */
     function emergencyWithdraw(uint256 _vaultId) external nonReentrant {
-        // 1. Checks
         Stake storage selectedStake = userStakes[msg.sender][_vaultId];
         require(selectedStake.amount > 0, "No active stake in this vault");
 
-        // 2. Effects
         uint256 principal = selectedStake.amount;
         totalStaked -= principal;
         delete userStakes[msg.sender][_vaultId];
 
-        // 3. Interactions
-        // --- UPDATED: Uses SafeERC20 consistently ---
         HBITToken.safeTransfer(msg.sender, principal);
         emit EmergencyWithdrawn(msg.sender, _vaultId, principal);
     }
 
-    // --- View & Helper Functions ---
+    /**
+     * @dev 이자 계산 내부 함수
+     * @notice 스테이킹 기간에 따른 이자를 계산합니다.
+     * @return 계산된 이자
+     */
     function _calculateRewards(uint256 _startTime, uint256 _amount, uint256 _apy) internal view returns (uint256) {
         uint256 timeElapsed = block.timestamp - _startTime;
         return Math.mulDiv(_amount * _apy * timeElapsed, 1, PRECISION_DIVISOR * 365 days);
     }
 
+    /**
+     * @dev 사용자 스테이킹 정보 조회
+     * @param _user 조회할 사용자 주소
+     * @param _vaultId 조회할 볼트 ID
+     * @return 스테이킹 정보
+     */
     function getStakeInfo(address _user, uint256 _vaultId) public view returns (Stake memory) {
         return userStakes[_user][_vaultId];
     }
     
+    /**
+     * @dev 볼트 정보 조회
+     * @param _vaultId 조회할 볼트 ID
+     * @return 볼트 정보
+     */
     function getVaultInfo(uint256 _vaultId) public view returns (Vault memory) {
         require(_vaultId < vaults.length, "Vault does not exist");
         return vaults[_vaultId];
     }
 }
+
