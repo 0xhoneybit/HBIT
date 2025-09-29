@@ -12,18 +12,20 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
  * This token has a fixed supply of 3.5 billion tokens with enhanced security features.
  */
 contract HONEYBIT is ERC20, Ownable, Pausable, ReentrancyGuard {
-    // 토큰 총 발행량: 3,500,000,000 HBIT (35억)
-    uint256 private constant INITIAL_SUPPLY = 3500000000 * 10**18; // 35억 * 10^18 (18자릿수)
+    // 토큰 총 발행량: 2,000,000,000 HBIT (20억)
+    uint256 private constant INITIAL_SUPPLY = 2000000000 * 10**18; // 20억 * 10^18 (18자릿수)
     // 한 번에 처리할 수 있는 최대 에어드랍 수신자 수
     uint256 private constant MAX_AIRDROP_BATCH_SIZE = 100;
+    uint256 private constant AIRDROP_LOCK_TIME = 24 hours; // 24시간 타임락
 
-    // 에어드랍 중복 수신자 방지를 위한 매핑
-    mapping(address => bool) private airdropTracker;
+    // 에어드랍 중복 수신자 방지를 위한 매핑 (타임스탬프 저장용으로 변경)
+    mapping(address => uint256) private airdropTracker; // uint256으로 변경: 0 = 미사용, >0 = 잠금 해제 타임스탬프
 
     // 이벤트 정의
     event TokensBurned(address indexed burner, uint256 amount);
     event Airdrop(address indexed recipient, uint256 amount);
     event EmergencyWithdrawn(address indexed owner, uint256 amount);
+    event AirdropTrackerCleared(address[] recipients); // 초기화 이벤트 추가
 
     /**
      * @dev 컨트랙트 생성자
@@ -45,7 +47,7 @@ contract HONEYBIT is ERC20, Ownable, Pausable, ReentrancyGuard {
     }
 
     /**
-     * @dev 대량 에어드랍 기능
+     * @dev 대량 에어드랍 기능 (24시간 타임락 적용)
      * @param recipients 에어드랍 수신자 주소 배열
      * @param amounts 각 수신자에게 전송할 토큰 수량 배열
      * @notice 중복 수신자 방지 및 가스 비용 최적화를 위해 배치 크기 제한
@@ -62,17 +64,28 @@ contract HONEYBIT is ERC20, Ownable, Pausable, ReentrancyGuard {
 
         for (uint256 i = 0; i < recipients.length; i++) {
             require(recipients[i] != address(0), "Airdrop to a zero address is not allowed");
-            require(!airdropTracker[recipients[i]], "Duplicate recipient detected");
-            airdropTracker[recipients[i]] = true;
+            require(airdropTracker[recipients[i]] == 0, "Duplicate recipient detected");
 
             _transfer(msg.sender, recipients[i], amounts[i]);
             emit Airdrop(recipients[i], amounts[i]);
-        }
 
-        // 에어드랍 트래커 초기화 (다음 airdrop 호출 시 다시 받을 수 있도록 허용)
-        for (uint256 i = 0; i < recipients.length; i++) {
-            airdropTracker[recipients[i]] = false;
+            // 24시간 후 초기화 가능하도록 타임스탬프 저장
+            airdropTracker[recipients[i]] = block.timestamp + AIRDROP_LOCK_TIME;
         }
+    }
+
+    /**
+     * @dev 24시간 후 에어드랍 트래커 초기화
+     * @param recipients 초기화할 수신자 주소 배열
+     */
+    function clearAirdropTracker(address[] calldata recipients) public onlyOwner nonReentrant {
+        uint256 currentTime = block.timestamp;
+        for (uint256 i = 0; i < recipients.length; i++) {
+            require(airdropTracker[recipients[i]] != 0, "No airdrop record");
+            require(airdropTracker[recipients[i]] <= currentTime, "24 hours not passed");
+            airdropTracker[recipients[i]] = 0;
+        }
+        emit AirdropTrackerCleared(recipients);
     }
 
     /**
@@ -110,10 +123,6 @@ contract HONEYBIT is ERC20, Ownable, Pausable, ReentrancyGuard {
         revert("Direct BNB transfers are not allowed");
     }
 
-    /**
-     * @dev 우발적인 BNB 전송 방지
-     * @notice 이 컨트랙트는 BNB를 직접 수신하지 않습니다.
-     */
     receive() external payable {
         revert("Direct BNB transfers are not allowed");
     }
