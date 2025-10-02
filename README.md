@@ -1,9 +1,9 @@
-# HoneyBit (HBIT)
+# HONEYBIT ($HBIT)
 
 [![Website](https://img.shields.io/badge/Website-honeybit.fun-blue?style=flat-square)](https://your_website_url_here)
 [![Twitter](https://img.shields.io/twitter/follow/0xhoneybit?style=social)](https://twitter.com/0xhoneybit)
 
-**HoneyBit is a project developing a platform on the BNB Chain to support various AI-driven applications.**
+**HONEYBIT is a project developing a platform on the BNB Chain to support various AI-driven applications.**
 
 This repository contains the official smart contracts for the HONEYBIT ecosystem, including the HBIT Token, Staking, and Presale contracts.
 
