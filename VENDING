@@ -12,12 +12,12 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 /**
- * @title HbitVendingMachine
+ * @title HbitVending
  * @author ZIN (HONEY BIT)
  * @notice $HBIT 토큰을 BNB 또는 USDT로 판매하는 '자판기' 컨트랙트입니다.
  * @dev "Pull" 모델을 사용하여 판매 대금은 컨트랙트에 보관되며, 소유자만 인출할 수 있습니다.
  */
-contract HbitVendingMachine is Ownable, Pausable, ReentrancyGuard {
+contract HbitVending is Ownable, Pausable, ReentrancyGuard {
     
     // SafeERC20 라이브러리를 IERC20 인터페이스에 사용합니다.
     using SafeERC20 for IERC20;
