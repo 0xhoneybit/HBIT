@@ -12,12 +12,12 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
 /**
- * @title HbitVending
+ * @title HbitVendingMachine
  * @author ZIN (HONEY BIT)
  * @notice $HBIT 토큰을 BNB 또는 USDT로 판매하는 '자판기' 컨트랙트입니다.
  * @dev "Pull" 모델을 사용하여 판매 대금은 컨트랙트에 보관되며, 소유자만 인출할 수 있습니다.
  */
-contract HbitVending is Ownable, Pausable, ReentrancyGuard {
+contract HbitVendingMachine is Ownable, Pausable, ReentrancyGuard {
     
     // SafeERC20 라이브러리를 IERC20 인터페이스에 사용합니다.
     using SafeERC20 for IERC20;
@@ -53,6 +53,7 @@ contract HbitVending is Ownable, Pausable, ReentrancyGuard {
     event BeneficiaryUpdated(address newBeneficiary);
     event BnbWithdrawn(address indexed to, uint256 amount);
     event UsdtWithdrawn(address indexed to, uint256 amount);
+    event HbitDeposited(address indexed from, uint256 amount); // HBIT 예치 이벤트
 
     // --- 생성자 (Constructor) ---
     constructor(
@@ -236,6 +237,20 @@ contract HbitVending is Ownable, Pausable, ReentrancyGuard {
         require(_newBeneficiary != address(0), "Invalid address");
         beneficiaryWallet = payable(_newBeneficiary);
         emit BeneficiaryUpdated(_newBeneficiary);
+    }
+
+    /**
+     * @notice 소유자가 판매할 HBIT 토큰을 컨트랙트에 예치합니다.
+     * @dev 호출 전에 소유자는 이 컨트랙트 주소로 HBIT 토큰을 'approve' 해야 합니다.
+     * @param _amount 예치할 HBIT 토큰의 수량
+     */
+    function depositHbit(uint256 _amount) external onlyOwner {
+        require(_amount > 0, "Amount must be positive");
+        
+        // hbitToken의 transferFrom을 호출하여 소유자(owner()) 지갑에서
+        // 이 컨트랙트(address(this))로 토큰을 가져옵니다.
+        hbitToken.safeTransferFrom(owner(), address(this), _amount);
+        emit HbitDeposited(owner(), _amount);
     }
 
     /**
