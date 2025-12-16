@@ -1,0 +1,239 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+contract HBIT_Faucet is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    /*
+        Faucet에서 사용할 ERC20 토큰
+        - 배포 시 생성자에서 토큰 주소를 지정
+        - 예: HBIT
+    */
+    IERC20 public immutable token;
+
+    /*
+        토큰이 18 decimals 기준일 때 1개 단위
+        (예: HBIT, 일반적인 ERC20)
+    */
+    uint256 public constant TOKEN_UNIT = 1e18;
+
+    /*
+        한 번 청구 시 지급되는 토큰 개수 범위
+        - 소수점 2자리(0.01) 단위로 계산
+        - 1200 = 12.00개, 5000 = 50.00개
+    */
+    uint256 public minTokenCount = 1200;
+    uint256 public maxTokenCount = 5000;
+
+    /*
+        지갑당 청구 쿨타임: 86,580초 (24시간 3분)
+    */
+    uint256 public cooldown = 86580;
+
+    /*
+        청구를 위해 필요한 최소 BNB 잔액 (0.005 BNB)
+    */
+    uint256 public constant MIN_BNB_BALANCE = 0.005 ether;
+
+    /*
+        지갑별 마지막 청구 시간 기록
+    */
+    mapping(address => uint256) public lastClaimed;
+
+    /*
+        컨트랙트 호출을 막고 EOA(일반 지갑)만 허용하는 옵션
+    */
+    bool public onlyEOA = true;
+
+    /*
+        전체 Faucet 기능을 일시 중지하는 스위치
+    */
+    bool public paused = false;
+
+    /*
+        블랙리스트
+        - 악용이 확인된 지갑은 여기 등록하여 사용 차단
+    */
+    mapping(address => bool) public blacklisted;
+
+    /*
+        이벤트 정의
+    */
+    event Claimed(address indexed user, uint256 tokenCountRaw, uint256 amount);
+    event CooldownUpdated(uint256 newCooldown);
+    event TokenCountRangeUpdated(uint256 minTokens, uint256 maxTokens);
+    event Paused(bool isPaused);
+    event OnlyEOAUpdated(bool onlyEOA);
+    event TokensDeposited(address indexed from, uint256 amount);
+    event TokensWithdrawn(address indexed to, uint256 amount);
+    event EmergencyTokenRecovered(address indexed token, address indexed to, uint256 amount);
+    event EmergencyBNBWithdrawn(address indexed to, uint256 amount);
+    event BlacklistUpdated(address indexed user, bool isBlacklisted);
+
+    /*
+        생성자
+        - _token: Faucet에서 지급할 ERC20 토큰 주소 (예: HBIT)
+        - Ownable(msg.sender): 배포자를 오너로 설정 (OpenZeppelin v5 대응)
+    */
+    constructor(address _token) Ownable(msg.sender) {
+        require(_token != address(0), "Token address required");
+        token = IERC20(_token);
+    }
+
+    /*
+        메인 수도꼭지 기능: 청구 조건 충족 시 토큰 지급
+        - 별도의 서명 없이 누구나 호출 가능
+    */
+    function claim() external nonReentrant {
+        address user = msg.sender;
+
+        require(!paused, "Faucet is paused");
+        require(!blacklisted[user], "Blacklisted user");
+
+        // 컨트랙트 호출 차단 (봇 및 악용 방지용)
+        if (onlyEOA) {
+            require(user == tx.origin, "Only EOA wallets allowed");
+        }
+
+        // 지갑 BNB 잔액 조건 확인
+        require(user.balance >= MIN_BNB_BALANCE, "Not enough BNB");
+
+        // 쿨타임 확인
+        uint256 last = lastClaimed[user];
+        require(block.timestamp >= last + cooldown, "Cooldown not finished");
+
+        // 지급 토큰 개수 계산 (1200~5000 랜덤)
+        uint256 tokenCountRaw = _randomTokenCount(user);
+        
+        // 소수점 2자리 처리를 위해 100으로 나눔 (TOKEN_UNIT / 100)
+        uint256 amount = tokenCountRaw * (TOKEN_UNIT / 100);
+
+        // 청구 시간 갱신
+        lastClaimed[user] = block.timestamp;
+
+        // 토큰 전송
+        token.safeTransfer(user, amount);
+
+        emit Claimed(user, tokenCountRaw, amount);
+    }
+
+    /*
+        랜덤 토큰 개수 산출 (보안 난수 아님)
+        - 블록 정보 및 지갑 정보를 기반으로 의사난수 생성
+        - Faucet처럼 소액 분배용 목적에 적합
+    */
+    function _randomTokenCount(address user) internal view returns (uint256) {
+        uint256 range = maxTokenCount - minTokenCount + 1;
+
+        uint256 rand = uint256(
+            keccak256(
+                abi.encodePacked(
+                    user,
+                    block.timestamp,
+                    blockhash(block.number - 1),
+                    lastClaimed[user]
+                )
+            )
+        );
+
+        uint256 offset = rand % range;
+        return minTokenCount + offset;
+    }
+
+    /*
+        쿨타임 설정
+    */
+    function setCooldown(uint256 _cooldown) external onlyOwner {
+        require(_cooldown > 0, "Cooldown must be greater than zero");
+        cooldown = _cooldown;
+        emit CooldownUpdated(_cooldown);
+    }
+
+    /*
+        랜덤 지급 범위 설정 (예: 1200~5000)
+        - 소수점 2자리를 포함한 정수값 입력 필요
+    */
+    function setTokenCountRange(uint256 _minTokens, uint256 _maxTokens) external onlyOwner {
+        require(_minTokens > 0, "Invalid min value");
+        require(_maxTokens >= _minTokens, "Invalid range");
+        minTokenCount = _minTokens;
+        maxTokenCount = _maxTokens;
+        emit TokenCountRangeUpdated(_minTokens, _maxTokens);
+    }
+
+    /*
+        Faucet 기능 전체 중지/재개
+    */
+    function setPaused(bool _paused) external onlyOwner {
+        paused = _paused;
+        emit Paused(_paused);
+    }
+
+    /*
+        EOA 지갑만 허용 여부 설정
+    */
+    function setOnlyEOA(bool _onlyEOA) external onlyOwner {
+        onlyEOA = _onlyEOA;
+        emit OnlyEOAUpdated(_onlyEOA);
+    }
+
+    /*
+        블랙리스트 설정/해제
+        - 악용 확인된 지갑은 여기 등록하여 Faucet 사용 차단
+    */
+    function setBlacklist(address user, bool isBlacklisted) external onlyOwner {
+        blacklisted[user] = isBlacklisted;
+        emit BlacklistUpdated(user, isBlacklisted);
+    }
+
+    /*
+        토큰 충전 (사전 approve 필요)
+    */
+    function depositToken(uint256 amount) external onlyOwner {
+        require(amount > 0, "Invalid amount");
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        emit TokensDeposited(msg.sender, amount);
+    }
+
+    /*
+        Faucet 잔고에서 토큰 회수
+    */
+    function withdrawToken(address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Zero address not allowed");
+        token.safeTransfer(to, amount);
+        emit TokensWithdrawn(to, amount);
+    }
+
+    /*
+        잘못 전송된 기타 ERC20 토큰 회수
+        - Faucet에서 사용하는 메인 토큰과는 별도로 처리
+    */
+    function emergencyRecoverERC20(address tokenAddress, address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Zero address not allowed");
+        require(tokenAddress != address(token), "Use withdrawToken for main token");
+
+        IERC20(tokenAddress).safeTransfer(to, amount);
+        emit EmergencyTokenRecovered(tokenAddress, to, amount);
+    }
+
+    /*
+        컨트랙트에 남아 있는 BNB 회수
+    */
+    function emergencyWithdrawBNB(address payable to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Zero address not allowed");
+        require(address(this).balance >= amount, "Insufficient BNB balance");
+        to.transfer(amount);
+        emit EmergencyBNBWithdrawn(to, amount);
+    }
+
+    /*
+        BNB 수신 허용
+        - 예기치 않은 입금 대비
+    */
+    receive() external payable {}
+}
